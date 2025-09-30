@@ -27,6 +27,12 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    # 限制容器日志大小
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # Nginx 反向代理 + Rate Limiting
   nginx:
@@ -40,11 +46,19 @@ services:
       - /dev/null:/etc/nginx/conf.d/default.conf:ro
       # 日志目录
       - nginx-logs:/var/log/nginx
+      # Logrotate 配置
+      - ./config/logrotate.conf:/etc/logrotate.d/nginx:ro
     networks:
       - internal
       - traefik-net  # TODO: 确认这是您的 Traefik 网络名称
     depends_on:
       - registry
+    # 限制容器日志大小
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     labels:
       # 启用 Traefik
       - "traefik.enable=true"
@@ -67,8 +81,8 @@ services:
       # 指定 Traefik 网络（如果有多个网络）
       - "traefik.docker.network=traefik-net"
       
-      # 可选：添加中间件（如果需要额外的安全头）
-      # - "traefik.http.routers.docker-proxy.middlewares=secure-headers@file"
+      # 传递真实客户端 IP
+      - "traefik.http.services.docker-proxy.loadbalancer.passhostheader=true"
 
 networks:
   # 内部网络（Nginx <-> Registry）

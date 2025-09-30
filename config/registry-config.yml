@@ -29,11 +29,11 @@ http:
     X-Content-Type-Options: [nosniff]
   
   # 调试端点（生产环境可关闭）
-  debug:
-    addr: :5001
-    prometheus:
-      enabled: false
-      path: /metrics
+  # debug:
+  #   addr: :5001
+  #   prometheus:
+  #     enabled: false
+  #     path: /metrics
 
 # 健康检查
 health:
@@ -43,6 +43,7 @@ health:
     threshold: 3
 
 # 代理配置 - 核心功能
+# 禁止推送镜像 
 proxy:
   # 上游 Docker Hub Registry
   remoteurl: https://registry-1.docker.io
