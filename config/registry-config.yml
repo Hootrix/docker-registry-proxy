@@ -1,0 +1,62 @@
+version: 0.1
+
+# 日志配置
+log:
+  level: info
+  formatter: text
+  fields:
+    service: registry
+    environment: production
+
+# 存储配置
+storage:
+  # 使用文件系统存储（代理模式下主要用于临时数据）
+  filesystem:
+    rootdirectory: /var/lib/registry
+  
+  # 启用删除功能
+  delete:
+    enabled: true
+  
+  # 缓存配置（可选，用于提升性能）
+  cache:
+    blobdescriptor: inmemory
+
+# HTTP 服务配置
+http:
+  addr: :5000
+  headers:
+    X-Content-Type-Options: [nosniff]
+  
+  # 调试端点（生产环境可关闭）
+  debug:
+    addr: :5001
+    prometheus:
+      enabled: false
+      path: /metrics
+
+# 健康检查
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3
+
+# 代理配置 - 核心功能
+proxy:
+  # 上游 Docker Hub Registry
+  remoteurl: https://registry-1.docker.io
+  
+  # 用户名和密码（如果需要访问私有镜像）
+  # TODO: 如果需要代理私有镜像，取消注释并配置
+  # username: your-dockerhub-username
+  # password: your-dockerhub-password-or-token
+  
+  # TTL 配置（可选）
+  # ttl: 168h  # 7天
+
+# 认证配置
+auth:
+  htpasswd:
+    realm: "Docker Registry Proxy"
+    path: /auth/htpasswd

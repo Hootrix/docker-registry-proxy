@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  # Docker Registry (proxy 模式)
+  registry:
+    image: registry:2
+    container_name: docker-registry-proxy
+    restart: unless-stopped
+    environment:
+      # Registry 配置文件路径
+      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+      # 启用删除功能（可选）
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      # 日志级别
+      REGISTRY_LOG_LEVEL: info
+    volumes:
+      # 挂载配置文件
+      - ./config/registry-config.yml:/etc/docker/registry/config.yml:ro
+      # 挂载认证文件
+      - ./auth/htpasswd:/auth/htpasswd:ro
+      # 数据目录（虽然是代理模式，但仍需要临时存储）
+      - registry-data:/var/lib/registry
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5000/v2/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Nginx 反向代理 + Rate Limiting
+  nginx:
+    image: nginx:alpine
+    container_name: docker-registry-nginx
+    restart: unless-stopped
+    volumes:
+      # Nginx 配置
+      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      # 日志目录
+      - nginx-logs:/var/log/nginx
+    networks:
+      - internal
+      - traefik-net  # TODO: 确认这是您的 Traefik 网络名称
+    depends_on:
+      - registry
+    labels:
+      # 启用 Traefik
+      - "traefik.enable=true"
+      
+      # TODO: 修改为您的实际域名
+      - "traefik.http.routers.docker-proxy.rule=Host(`docker-proxy.yourdomain.com`)"
+      
+      # TODO: 确认您的 Traefik HTTPS entrypoint 名称（常见：websecure, https）
+      - "traefik.http.routers.docker-proxy.entrypoints=websecure"
+      
+      # TODO: 修改为您的 Traefik certresolver 名称（常见：letsencrypt, le, myresolver）
+      - "traefik.http.routers.docker-proxy.tls.certresolver=letsencrypt"
+      
+      # 自动申请 TLS 证书
+      - "traefik.http.routers.docker-proxy.tls=true"
+      
+      # 指定服务端口
+      - "traefik.http.services.docker-proxy.loadbalancer.server.port=80"
+      
+      # 指定 Traefik 网络（如果有多个网络）
+      - "traefik.docker.network=traefik-net"
+      
+      # 可选：添加中间件（如果需要额外的安全头）
+      # - "traefik.http.routers.docker-proxy.middlewares=secure-headers@file"
+
+networks:
+  # 内部网络（Nginx <-> Registry）
+  internal:
+    driver: bridge
+  
+  # Traefik 外部网络
+  traefik-net:
+    external: true  # TODO: 如果网络不存在，需要先创建：docker network create traefik-net
+
+volumes:
+  # Registry 数据卷（代理模式下主要存储临时数据和缓存）
+  registry-data:
+  # Nginx 日志
+  nginx-logs:
