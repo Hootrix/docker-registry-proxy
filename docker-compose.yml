@@ -50,7 +50,7 @@ services:
       - ./config/logrotate.conf:/etc/logrotate.d/nginx:ro
     networks:
       - internal
-      - traefik-net  # TODO: 确认这是您的 Traefik 网络名称
+      - ${TRAEFIK_NETWORK:-traefik-net}
     depends_on:
       - registry
     # 限制容器日志大小
@@ -63,14 +63,14 @@ services:
       # 启用 Traefik
       - "traefik.enable=true"
       
-      # TODO: 修改为您的实际域名
-      - "traefik.http.routers.docker-proxy.rule=Host(`docker-proxy.yourdomain.com`)"
+      # 域名配置（从 .env 读取）
+      - "traefik.http.routers.docker-proxy.rule=Host(`${REGISTRY_DOMAIN:-docker-proxy.yourdomain.com}`)"
       
-      # TODO: 确认您的 Traefik HTTPS entrypoint 名称（常见：websecure, https）
-      - "traefik.http.routers.docker-proxy.entrypoints=websecure"
+      # HTTPS entrypoint（从 .env 读取）
+      - "traefik.http.routers.docker-proxy.entrypoints=${TRAEFIK_ENTRYPOINT:-websecure}"
       
-      # TODO: 修改为您的 Traefik certresolver 名称（常见：letsencrypt, le, myresolver）
-      - "traefik.http.routers.docker-proxy.tls.certresolver=letsencrypt"
+      # TLS 证书解析器（从 .env 读取）
+      - "traefik.http.routers.docker-proxy.tls.certresolver=${TRAEFIK_CERTRESOLVER:-letsencrypt}"
       
       # 自动申请 TLS 证书
       - "traefik.http.routers.docker-proxy.tls=true"
@@ -79,7 +79,7 @@ services:
       - "traefik.http.services.docker-proxy.loadbalancer.server.port=80"
       
       # 指定 Traefik 网络（如果有多个网络）
-      - "traefik.docker.network=traefik-net"
+      - "traefik.docker.network=${TRAEFIK_NETWORK:-traefik-net}"
       
       # 传递真实客户端 IP
       - "traefik.http.services.docker-proxy.loadbalancer.passhostheader=true"
