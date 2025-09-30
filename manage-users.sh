@@ -93,6 +93,16 @@ add_user() {
         echo "  docker login docker-proxy.yourdomain.com"
         echo "  用户名: $username"
         echo "  密码: ********"
+        
+        # 重启 Registry 容器以使更改生效
+        echo ""
+        echo "🔄 重启 Registry 容器以加载新用户..."
+        if command -v docker-compose &> /dev/null && [ -f "docker-compose.yml" ]; then
+            docker-compose restart registry > /dev/null 2>&1
+            echo -e "${GREEN}✅ Registry 已重启，新用户可以立即使用${NC}"
+        else
+            echo -e "${YELLOW}⚠️  请手动重启 Registry 容器: docker-compose restart registry${NC}"
+        fi
     else
         echo -e "${RED}❌ 错误: 添加用户失败${NC}"
         exit 1
@@ -127,6 +137,20 @@ delete_user() {
     
     if [ "$silent" != "silent" ]; then
         echo -e "${GREEN}✅ 用户 '$username' 已删除${NC}"
+        
+        # 重启 Registry 容器以使更改生效
+        echo ""
+        echo "🔄 重启 Registry 容器以清除认证缓存..."
+        if command -v docker-compose &> /dev/null && [ -f "docker-compose.yml" ]; then
+            docker-compose restart registry > /dev/null 2>&1
+            echo -e "${GREEN}✅ Registry 已重启，用户权限已立即生效${NC}"
+            echo ""
+            echo -e "${YELLOW}📌 注意: 如果该用户已在客户端登录，需要重新登录:${NC}"
+            echo "   docker logout docker-proxy.yourdomain.com"
+            echo "   (删除本地缓存的认证信息)"
+        else
+            echo -e "${YELLOW}⚠️  请手动重启 Registry 容器: docker-compose restart registry${NC}"
+        fi
     fi
 }
 
@@ -141,8 +165,11 @@ list_users() {
     
     local count=0
     while IFS=: read -r username hash; do
-        count=$((count + 1))
-        echo "  $count. $username"
+        # 跳过空行
+        if [ -n "$username" ]; then
+            count=$((count + 1))
+            echo "  $count. $username"
+        fi
     done < "$HTPASSWD_FILE"
     
     echo ""
