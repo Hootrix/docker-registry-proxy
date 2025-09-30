@@ -39,9 +39,14 @@ services:
     image: nginx:alpine
     container_name: docker-registry-nginx
     restart: unless-stopped
+    environment:
+      # Rate Limiting 配置（从 .env 读取）
+      - RATE_LIMIT_RPS=${RATE_LIMIT_RPS:-10}
+      - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-20}
+      - RATE_LIMIT_CONN=${RATE_LIMIT_CONN:-10}
     volumes:
-      # Nginx 配置
-      - ./config/nginx.conf:/etc/nginx/nginx.conf:ro
+      # nginx:alpine镜像 支持envsubst模板功能  自动替换变量生成conf文件
+      - ./config/nginx.conf:/etc/nginx/templates/nginx.conf.template:ro
       # 禁用默认配置（防止冲突）
       - /dev/null:/etc/nginx/conf.d/default.conf:ro
       # 日志目录
