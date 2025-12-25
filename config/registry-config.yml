@@ -22,8 +22,9 @@ storage:
   cache:
     blobdescriptor: inmemory
 
-redirect:
-  disable: true
+  # 禁用重定向
+  redirect:
+    disable: true
 
 # HTTP 服务配置
 http:

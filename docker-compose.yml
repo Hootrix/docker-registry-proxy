@@ -12,8 +12,8 @@ services:
       # 启用删除功能（可选）
       REGISTRY_STORAGE_DELETE_ENABLED: "true"
       # 日志级别
-      REGISTRY_LOG_LEVEL: debug
-      # REGISTRY_LOG_LEVEL: info
+      # REGISTRY_LOG_LEVEL: debug
+      REGISTRY_LOG_LEVEL: info
     volumes:
       # 挂载配置文件
       - ./config/registry-config.yml:/etc/docker/registry/config.yml:ro
