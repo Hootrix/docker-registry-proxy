@@ -12,7 +12,8 @@ services:
       # 启用删除功能（可选）
       REGISTRY_STORAGE_DELETE_ENABLED: "true"
       # 日志级别
-      REGISTRY_LOG_LEVEL: info
+      REGISTRY_LOG_LEVEL: debug
+      # REGISTRY_LOG_LEVEL: info
     volumes:
       # 挂载配置文件
       - ./config/registry-config.yml:/etc/docker/registry/config.yml:ro
@@ -23,7 +24,7 @@ services:
     networks:
       - internal
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:5000/v2/"]
+      test: ["CMD-SHELL", "code=$(wget -S --spider -q http://localhost:5000/v2/ 2>&1 | awk '/^  HTTP\\//{print $2; exit}'); [ \"$code\" = \"200\" ] || [ \"$code\" = \"401\" ]"]
       interval: 30s
       timeout: 10s
       retries: 3
