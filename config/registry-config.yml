@@ -22,6 +22,9 @@ storage:
   cache:
     blobdescriptor: inmemory
 
+redirect:
+  disable: true
+
 # HTTP 服务配置
 http:
   addr: :5000
