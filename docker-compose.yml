@@ -24,7 +24,7 @@ services:
     networks:
       - internal
     healthcheck:
-      test: ["CMD-SHELL", "code=$(wget -S --spider -q http://localhost:5000/v2/ 2>&1 | awk '/^  HTTP\\//{print $$2; exit}'); [ \"$$code\" = \"200\" ] || [ \"$$code\" = \"401\" ]"]
+      test: ["CMD-SHELL", "code=$$(wget -S --spider -q http://localhost:5000/v2/ 2>&1 | awk '/^  HTTP\\//{print $$2; exit}'); [ \"$$code\" = \"200\" ] || [ \"$$code\" = \"401\" ]"]
       interval: 30s
       timeout: 10s
       retries: 3
