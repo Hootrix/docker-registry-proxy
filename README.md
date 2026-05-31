@@ -80,7 +80,10 @@ docker login registry.example.com
 ### 拉取镜像
 
 ```bash
-# 官方镜像（需要 library/ 前缀）
+# 官方镜像
+docker pull registry.example.com/alpine:latest
+
+# 官方镜像 可选手动添加 library/ 前缀
 docker pull registry.example.com/library/nginx:alpine
 docker pull registry.example.com/library/redis:latest
 
