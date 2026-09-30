@@ -178,3 +178,145 @@ cmd_list() {
         printf '%-24s %-8s %-36s %s\n' "$host" "$mark" "$url" "$auth"
     done < <(list_hosts)
 }
+
+# ---- 生成器（全部写入临时目录，apply 统一原子切换）----
+
+# generate_registry_conf <host> <outfile>
+# 基于原 config/registry-config.yml 结构；凭据存在时附加 proxy.username/password
+generate_registry_conf() {
+    local host=$1 out=$2 remoteurl user pass auth_block=""
+    remoteurl=$(get_field "$REGISTRIES_DIR/$host.yml" remoteurl)
+    user=$(get_field "$REGISTRIES_DIR/$host.yml" username)
+    pass=$(get_field "$REGISTRIES_DIR/$host.yml" password)
+    # 边界：username/password 必须成对，只有用户名无密码时按匿名处理并警告
+    if [ -n "$user" ] && [ -z "$pass" ]; then
+        warn "$host: 有 username 无 password，按匿名上游处理"
+        user=""
+    fi
+    if [ -n "$user" ]; then
+        auth_block=$'\n  username: '"$user"$'\n  password: '"$pass"
+    fi
+    cat > "$out" <<EOF
+# 自动生成（apply 会覆盖）——上游: $host
+version: 0.1
+log:
+  level: ${REGISTRY_LOG_LEVEL:-info}
+  formatter: text
+  fields:
+    service: registry
+    environment: production
+storage:
+  filesystem:
+    rootdirectory: /var/lib/registry
+  delete:
+    enabled: true
+  cache:
+    blobdescriptor: inmemory
+  redirect:
+    disable: true
+http:
+  addr: :5000
+  headers:
+    X-Content-Type-Options: [nosniff]
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3
+proxy:
+  remoteurl: $remoteurl$auth_block
+auth:
+  htpasswd:
+    realm: "Docker Registry Proxy"
+    path: /auth/htpasswd
+EOF
+}
+
+# generate_nginx_confs <host> <http_out> <loc_out>
+# http 级 upstream + server 级 location；限流值从 .env 烘焙为字面量（生成文件不经 envsubst）
+generate_nginx_confs() {
+    local host=$1 http_out=$2 loc_out=$3
+    local svc up escaped burst conn completion=""
+    svc=$(service_name "$host")
+    up="upstream_$(upstream_id "$host")"
+    escaped=$(regex_escape "$host")
+    burst=${RATE_LIMIT_BURST:-20}
+    conn=${RATE_LIMIT_CONN:-10}
+
+    cat > "$http_out" <<EOF
+# 自动生成（apply 会覆盖）——上游: $host
+upstream $up {
+    server $svc:5000;
+    keepalive 32;
+}
+EOF
+
+    # docker.io 专属：library/ 补全（官方镜像单段名），置于剥离规则前（rewrite break 首个命中即停）
+    # 字符类 [^./]+：[^.] 单用会误捕 bitnami/nginx 这类多段 repo
+    if [ "$host" = "$DEFAULT_UPSTREAM" ]; then
+        completion="    rewrite ^/v2/$escaped/([^./]+)/(manifests|blobs|tags)/(.*)\$ /v2/library/\$1/\$2/\$3 break;"$'\n'
+    fi
+
+    cat > "$loc_out" <<EOF
+# 自动生成（apply 会覆盖）——上游: $host
+location ~ ^/v2/($escaped)(?<prefix_rest>/.*)?\$ {
+    include /etc/nginx/snippets/proxy-common.conf;
+    # 裸前缀（/v2/ghcr.io）兜底：避免 rewrite 出 /v2 被 301 丢前缀
+    if (\$prefix_rest = "") { return 404; }
+    # 限流值为生成时烘焙的字面量；改 .env 后需重新 apply
+    limit_req zone=registry_limit burst=$burst nodelay;
+    limit_conn registry_conn $conn;
+$completion    rewrite ^ /v2\$prefix_rest break;
+    proxy_pass http://$up;
+}
+EOF
+}
+
+# generate_override <outfile> <host...>
+# 每上游一个 registry 实例；nginx 追加 depends_on（启动时 DNS 名已存在，upstream 解析不失败）
+generate_override() {
+    local out=$1; shift
+    local host svc cname vol extra_vols="" svc_blocks="" deps=""
+    for host in "$@"; do
+        svc=$(service_name "$host")
+        cname=$(container_name "$host")
+        vol=$(volume_name "$host")
+        if [ "$host" != "$DEFAULT_UPSTREAM" ]; then
+            extra_vols+="  $vol:"$'\n'
+        fi
+        deps+="      - $svc"$'\n'
+        svc_blocks+="  $svc:
+    image: registry:2
+    container_name: $cname
+    restart: unless-stopped
+    # 覆盖镜像默认 config 路径（目录挂载 + 指定文件，避免单文件挂载的 inode 问题）
+    command: /etc/docker/registry-custom/$host.yml
+    volumes:
+      - ./config/generated/registry:/etc/docker/registry-custom:ro
+      - ./auth/htpasswd:/auth/htpasswd:ro
+      - $vol:/var/lib/registry
+    networks:
+      - internal
+    healthcheck:
+      test: [\"CMD-SHELL\", \"code=\$\$(wget -S --spider -q http://localhost:5000/v2/ 2>&1 | awk '/^  HTTP\\\\//{print \$\$2; exit}'); [ \\\"\$\$code\\\" = \\\"200\\\" ] || [ \\\"\$\$code\\\" = \\\"401\\\" ]\"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: \"json-file\"
+      options:
+        max-size: \"10m\"
+        max-file: \"3\"
+"$'\n'
+    done
+    cat > "$out" <<EOF
+# 自动生成（apply 会覆盖）——多上游 registry 实例
+services:
+$svc_blocks
+  nginx:
+    depends_on:
+$deps
+volumes:
+$extra_vols
+EOF
+}
