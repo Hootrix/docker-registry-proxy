@@ -10,6 +10,14 @@ auth/htpasswd
 # Docker 相关
 .docker/
 
+# 多上游：上游声明（可能含凭据）与生成物
+config/registries/
+config/generated/
+docker-compose.override.yml
+docker-compose.test.yml
+docker-compose.override.yaml
+docker-compose.test.yaml
+
 # 编辑器
 .vscode/
 .idea/

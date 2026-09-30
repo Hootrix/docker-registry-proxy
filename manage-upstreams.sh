@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+# manage-upstreams.sh — 多上游管理：声明式配置（config/registries/*.yml）→ 生成 → 一条命令生效
+# 设计文档: docs/superpowers/specs/2026-09-30-multi-upstream-design.md
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# 目录可被测试覆盖（REGISTRIES_DIR=/tmp/fixtures ./manage-upstreams.sh list）
+REGISTRIES_DIR="${REGISTRIES_DIR:-config/registries}"
+GEN_DIR="${GEN_DIR:-config/generated}"
+GEN_REGISTRY="$GEN_DIR/registry"
+GEN_HTTP="$GEN_DIR/nginx/http-upstreams"
+GEN_LOC="$GEN_DIR/nginx/locations"
+OVERRIDE="${OVERRIDE:-docker-compose.override.yml}"
+
+DEFAULT_UPSTREAM="docker.io"   # 固定：模板默认路由/补全语义仅对 docker.io 成立
+
+RED=$'\033[0;31m'; GREEN=$'\033[1;32m'; YELLOW=$'\033[1;33m'; NC=$'\033[0m'
+info() { printf '%s\n' "${GREEN}[INFO]${NC} $*"; }
+warn() { printf '%s\n' "${YELLOW}[WARN]${NC} $*"; }
+die()  { printf '%s\n' "${RED}[ERROR]${NC} $*" >&2; exit 1; }
+
+usage() {
+    cat <<'USAGE'
+Docker Registry Proxy — 多上游管理
+
+用法: ./manage-upstreams.sh <命令> [参数]
+
+命令:
+  add <host> [--remoteurl URL] [--username USER] [--password PASS] [--force]
+                                   新增上游（host 如 ghcr.io），写入声明并立即生效
+                                   已存在时报错；--force 覆盖；--password 不安全（会进 history）
+  remove <host>                    移除非默认上游（数据卷保留）
+  list                             列出所有上游
+  apply                            重新生成全部配置并生效（手改 yml 后执行）
+
+示例:
+  ./manage-upstreams.sh add docker.io          # 首次初始化（默认上游必配）
+  ./manage-upstreams.sh add ghcr.io            # 新增 ghcr
+  ./manage-upstreams.sh add ghcr.io --username me   # 私有镜像（交互输 PAT）
+USAGE
+}
+
+# ---- 环境与声明文件解析 ----
+
+# 只导出 .env 中 KEY=VALUE 行（不 source 整个文件，避免执行任意内容）
+load_env() {
+    [ -f .env ] || die "缺少 .env，先执行: cp .env.example .env"
+    local k v
+    while IFS='=' read -r k v; do
+        case "$k" in ''|\#*) continue ;; esac
+        # 值清洗顺序（确定性，对齐 compose 语义）：去行尾 CR → 截掉行内注释（首个 " #" 起）→ 去一层成对引号
+        # 已知取舍：带引号的值自身含 " #" 时会被截断（注释先于引号处理）
+        v="${v%$'\r'}"
+        v="${v%% \#*}"
+        case "$v" in
+            \"*\") v="${v#\"}"; v="${v%\"}" ;;
+            \'*\') v="${v#\'}"; v="${v%\'}" ;;
+        esac
+        # env 优先：调用方已设置（含空值）的变量不被 .env 覆盖
+        # （目录变量的测试覆盖契约依赖此语义；也防止 .env 意外覆盖 PATH 等）
+        if [ -z "${!k+x}" ]; then export "$k=$v"; fi
+    done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env)
+    # 边界：DEFAULT_UPSTREAM 仅支持 docker.io（默认 location 的 library/ 补全语义）
+    [ "${DEFAULT_UPSTREAM:-docker.io}" = "docker.io" ] \
+        || die "DEFAULT_UPSTREAM 当前仅支持 docker.io"
+    # 边界：RPS 与 BURST/CONN 同为限流值——非法值经 envsubst 进模板只在容器内 nginx -t 才暴露
+    # （报错行号对应合并后配置，难定位）；BURST/CONN 消费点在生成器故在生成器内校验（见
+    # generate_nginx_confs），RPS 消费点在 nginx 模板（compose up 时渲染）故在此校验（.env 唯一入口）
+    case "${RATE_LIMIT_RPS:-10}" in ''|*[!0-9]*) die "RATE_LIMIT_RPS 非法: ${RATE_LIMIT_RPS}（需为非负整数）" ;; esac
+}
+
+# 平面 YAML 解析：输出 "key<TAB>value"；按首个冒号切分（remoteurl 值含 ://）；跳过注释/空行
+# 值规则：含 " #"（行内注释）→ 整行拒绝（fail-closed：不支持值内注释，避免静默截断 URL）；
+#        成对引号去一层；重复键由 get_field 取最后值（对齐 YAML 覆盖语义）
+parse_flat_yaml() {
+    awk -v sq="'" '
+        function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        {
+            i = index($0, ":")
+            if (i == 0) next
+            key = tolower(trim(substr($0, 1, i - 1)))
+            val = trim(substr($0, i + 1))
+            if (key == "" || val == "") next
+            if (val ~ / #/) next
+            q = substr(val, 1, 1)
+            if (length(val) >= 2 && (q == "\"" || q == sq) && substr(val, length(val)) == q)
+                val = substr(val, 2, length(val) - 2)
+            print key "\t" val
+        }
+    ' "$1"
+}
+
+# get_field <file> <key> [default]（同键多行取最后一个，符合 YAML 常规覆盖语义）
+get_field() {
+    local val
+    val=$(parse_flat_yaml "$1" | awk -F'\t' -v k="$2" '$1 == k { v = $2 } END { print v }')
+    printf '%s' "${val:-${3:-}}"
+}
+
+# ---- 命名派生（单点：服务名/容器名/卷名/upstream 名都从这里出）----
+
+# 归一化：. 和 - 统一为 -（ghcr.io → ghcr-io）
+# 注意必须输出换行：validate_all 的归一化冲突检测靠管道按行处理；
+# 命令替换 $(norm_host ...) 会自动剥掉尾部换行，故对其他调用点无影响
+norm_host() { printf '%s\n' "$1" | tr '.-' '-'; }
+# nginx upstream 标识符：. 和 - → _（同样依赖换行保证按行输出）
+upstream_id() { printf '%s\n' "$1" | tr '.-' '__'; }
+# 服务名：默认上游固定 registry（docker-compose.yml 的 depends_on / manage-users.sh 依赖此名）
+service_name() {
+    if [ "$1" = "$DEFAULT_UPSTREAM" ]; then echo "registry"
+    else echo "registry-$(norm_host "$1")"; fi
+}
+# 容器名：默认沿用 docker-registry-proxy（外部脚本/监控可能引用）
+container_name() {
+    if [ "$1" = "$DEFAULT_UPSTREAM" ]; then echo "docker-registry-proxy"
+    else echo "docker-registry-$(norm_host "$1")"; fi
+}
+# 卷名：默认沿用 registry-data（保留现有缓存卷）
+volume_name() {
+    if [ "$1" = "$DEFAULT_UPSTREAM" ]; then echo "registry-data"
+    else echo "registry-data-$(norm_host "$1")"; fi
+}
+# nginx 正则转义（点 → \.）；与其余取值函数一致按行输出（命令替换会剥掉换行）
+regex_escape() { printf '%s\n' "$1" | sed 's/[.]/\\./g'; }
+
+# YAML 双引号纯量：转义 \ 与 " 后包裹——挡住值含 ": "、前导 &、不成对引号等破坏非引号纯量的字符
+yaml_quote() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '"%s"' "$s"
+}
+
+list_hosts() {
+    [ -d "$REGISTRIES_DIR" ] || return 0
+    # /^$/d：basename 恰为 ".yml" 的文件会产出空行
+    find "$REGISTRIES_DIR" -maxdepth 1 -name '*.yml' -type f | sed 's|.*/||; s|\.yml$||; /^$/d' | sort
+}
+
+# ---- 校验 ----
+
+validate_all() {
+    local hosts host dup culprits
+    hosts=$(list_hosts)
+    [ -n "$hosts" ] || die "$REGISTRIES_DIR 为空——先执行: ./manage-upstreams.sh add $DEFAULT_UPSTREAM"
+    # 默认上游必配：模板默认路由（无前缀请求）指向其实例，缺失会导致 nginx 起不来
+    [ -f "$REGISTRIES_DIR/${DEFAULT_UPSTREAM}.yml" ] \
+        || die "缺少 ${DEFAULT_UPSTREAM}.yml（默认上游必配）"
+    # 逐行 read 而非 for 分词迭代：host 未过校验前不能分词/glob
+    # （"a b.yml" 会被拆成两个"host"、含 * 的名字会被展开），字符集校验必须针对原始文件名
+    while IFS= read -r host; do
+        [ -n "$host" ] || continue
+        # 边界：host 字符集（服务名/DNS/location 正则安全）
+        [[ "$host" =~ ^[a-z0-9][a-z0-9.-]*$ ]] \
+            || die "非法 host 名: ${host}（需匹配 ^[a-z0-9][a-z0-9.-]*\$）"
+        # 注：变量后紧跟全角括号必须加 {}，否则 macOS 自带 bash 3.2 会把多字节字符
+        # 当作变量名的一部分 → "unbound variable"，错误信息本身都打不出来
+        case "$host" in _*) die "非法 host 名: ${host}（不允许下划线开头）";; esac
+        [ "$host" = "_catalog" ] && die "保留名: $host"
+        [ -n "$(get_field "$REGISTRIES_DIR/$host.yml" remoteurl)" ] \
+            || die "$host: 缺少 remoteurl"
+    done < <(list_hosts)
+    # 边界：归一化冲突（a-b.com 与 a.b.com 同归一化 → 静默指向同一实例，必须拒绝）
+    dup=$(list_hosts | while IFS= read -r h; do norm_host "$h"; done | sort | awk 'seen[$0]++{print; exit}')
+    [ -z "$dup" ] || {
+        # 找出归一化后撞名的来源 host，便于定位声明文件
+        # 用 if 而非 "&& echo"：最后一个 host 不匹配时循环退出码为 1，
+        # 叠加 pipefail 会让整个命令替换"失败"，set -e 下冲突报错反而打不出来
+        culprits=$(list_hosts | while IFS= read -r h; do
+            if [ "$(norm_host "$h")" = "$dup" ]; then echo "$h"; fi
+        done | paste -sd' ' -)
+        die "归一化名冲突: ${dup}（来自: ${culprits}）"
+    }
+}
+
+# ---- list ----
+
+cmd_list() {
+    local host url mark auth
+    printf '%-24s %-8s %-36s %s\n' HOST DEFAULT REMOTEURL AUTH
+    while IFS= read -r host; do
+        [ -n "$host" ] || continue
+        url=$(get_field "$REGISTRIES_DIR/$host.yml" remoteurl "-")
+        if [ "$host" = "$DEFAULT_UPSTREAM" ]; then mark="yes"; else mark=""; fi
+        if [ -n "$(get_field "$REGISTRIES_DIR/$host.yml" username)" ]; then auth="user/pass"; else auth="anon"; fi
+        printf '%-24s %-8s %-36s %s\n' "$host" "$mark" "$url" "$auth"
+    done < <(list_hosts)
+}
+
+# ---- 生成器（全部写入临时目录，apply 统一原子切换）----
+
+# generate_registry_conf <host> <outfile>
+# 基于原 config/registry-config.yml 结构；凭据存在时附加 proxy.username/password
+generate_registry_conf() {
+    local host=$1 out=$2 remoteurl user pass auth_block=""
+    remoteurl=$(get_field "$REGISTRIES_DIR/$host.yml" remoteurl)
+    user=$(get_field "$REGISTRIES_DIR/$host.yml" username)
+    pass=$(get_field "$REGISTRIES_DIR/$host.yml" password)
+    # 边界：username/password 必须成对，半边缺失时按匿名处理并警告（仅手改 yml 会出现，add 不会写出这种状态）
+    if [ -n "$user" ] && [ -z "$pass" ]; then
+        warn "$host: 有 username 无 password，按匿名上游处理"
+        user=""
+    fi
+    # 旧写法只挡了"有 username 无 password"一侧；补对称分支，否则孤密码会被静默写入配置
+    if [ -n "$pass" ] && [ -z "$user" ]; then
+        warn "$host: 有 password 无 username，按匿名上游处理"
+        pass=""
+    fi
+    # 旧写法 auth_block 直接内插裸值（username: $user）——密码含 ": " 即产出非法 YAML，
+    # 前导 & 会被解析为锚点致密码变 null；统一经 yaml_quote 包裹
+    if [ -n "$user" ]; then
+        auth_block=$'\n  username: '"$(yaml_quote "$user")"$'\n  password: '"$(yaml_quote "$pass")"
+    fi
+    # 旧写法 heredoc 内裸内插（level: ${REGISTRY_LOG_LEVEL:-info} / remoteurl: $remoteurl），
+    # 同样有 ": " / & / 引号破坏 YAML 的问题；改经 yaml_quote
+    cat > "$out" <<EOF
+# 自动生成（apply 会覆盖）——上游: $host
+version: 0.1
+log:
+  level: $(yaml_quote "${REGISTRY_LOG_LEVEL:-info}")
+  formatter: text
+  fields:
+    service: registry
+    environment: production
+storage:
+  filesystem:
+    rootdirectory: /var/lib/registry
+  delete:
+    enabled: true
+  cache:
+    blobdescriptor: inmemory
+  redirect:
+    disable: true
+http:
+  addr: :5000
+  headers:
+    X-Content-Type-Options: [nosniff]
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3
+proxy:
+  remoteurl: $(yaml_quote "$remoteurl")$auth_block
+auth:
+  htpasswd:
+    realm: "Docker Registry Proxy"
+    path: /auth/htpasswd
+EOF
+}
+
+# generate_nginx_confs <host> <http_out> <loc_out>
+# http 级 upstream + server 级 location；限流值从 .env 烘焙为字面量（生成文件不经 envsubst）
+generate_nginx_confs() {
+    local host=$1 http_out=$2 loc_out=$3
+    local svc up escaped burst conn completion=""
+    svc=$(service_name "$host")
+    up="upstream_$(upstream_id "$host")"
+    escaped=$(regex_escape "$host")
+    burst=${RATE_LIMIT_BURST:-20}
+    conn=${RATE_LIMIT_CONN:-10}
+    # 边界：非数字值原样烘焙只会在容器内 nginx -t 才暴露（报错行号对应合并后配置，难定位）——生成期直接拒绝
+    # 旧写法无校验；case 字符类匹配 macOS bash 3.2 可用（regex 需 [[ =~ ]]，此处不必）
+    case "$burst" in ''|*[!0-9]*) die "RATE_LIMIT_BURST 非法: ${burst}（需为非负整数）" ;; esac
+    case "$conn" in ''|*[!0-9]*) die "RATE_LIMIT_CONN 非法: ${conn}（需为非负整数）" ;; esac
+
+    cat > "$http_out" <<EOF
+# 自动生成（apply 会覆盖）——上游: $host
+upstream $up {
+    server $svc:5000;
+    keepalive 32;
+}
+EOF
+
+    # docker.io 专属：library/ 补全（官方镜像单段名），置于剥离规则前（rewrite break 首个命中即停）
+    # 字符类 [^./]+：[^.] 单用会误捕 bitnami/nginx 这类多段 repo
+    if [ "$host" = "$DEFAULT_UPSTREAM" ]; then
+        completion="    rewrite ^/v2/$escaped/([^./]+)/(manifests|blobs|tags)/(.*)\$ /v2/library/\$1/\$2/\$3 break;"$'\n'
+    fi
+
+    cat > "$loc_out" <<EOF
+# 自动生成（apply 会覆盖）——上游: $host
+location ~ ^/v2/($escaped)(?<prefix_rest>/.*)?\$ {
+    include /etc/nginx/snippets/proxy-common.conf;
+    # 裸前缀（/v2/${host}）兜底：避免 rewrite 出 /v2 被 301 丢前缀（花括号必加，坑见 validate_all 注释）
+    if (\$prefix_rest = "") { return 404; }
+    # 限流值为生成时烘焙的字面量；改 .env 后需重新 apply
+    limit_req zone=registry_limit burst=$burst nodelay;
+    limit_conn registry_conn $conn;
+$completion    rewrite ^ /v2\$prefix_rest break;
+    proxy_pass http://$up;
+}
+EOF
+}
+
+# generate_override <outfile> <host...>
+# 每上游一个 registry 实例；nginx 追加 depends_on（启动时 DNS 名已存在，upstream 解析不失败）
+generate_override() {
+    local out=$1; shift
+    local host svc cname vol extra_vols="" svc_blocks="" deps="" vols_section=""
+    for host in "$@"; do
+        svc=$(service_name "$host")
+        cname=$(container_name "$host")
+        vol=$(volume_name "$host")
+        if [ "$host" != "$DEFAULT_UPSTREAM" ]; then
+            extra_vols+="  $vol:"$'\n'
+        fi
+        deps+="      - $svc"$'\n'
+        svc_blocks+="  $svc:
+    image: registry:2
+    container_name: $cname
+    restart: unless-stopped
+    # 覆盖镜像默认 config 路径（目录挂载 + 指定文件，避免单文件挂载的 inode 问题）
+    command: /etc/docker/registry-custom/$host.yml
+    volumes:
+      - ./config/generated/registry:/etc/docker/registry-custom:ro
+      - ./auth/htpasswd:/auth/htpasswd:ro
+      - $vol:/var/lib/registry
+    networks:
+      - internal
+    healthcheck:
+      test: [\"CMD-SHELL\", \"code=\$\$(wget -S --spider -q http://localhost:5000/v2/ 2>&1 | awk '/^  HTTP\\\\//{print \$\$2; exit}'); [ \\\"\$\$code\\\" = \\\"200\\\" ] || [ \\\"\$\$code\\\" = \\\"401\\\" ]\"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: \"json-file\"
+      options:
+        max-size: \"10m\"
+        max-file: \"3\"
+"$'\n'
+    done
+    # 旧写法恒输出 volumes:（$extra_vols）——仅默认上游时是尾随的空 null 段（compose 容忍但难看）；
+    # 改为仅存在非默认上游时才组装并输出 volumes 段
+    if [ -n "$extra_vols" ]; then
+        vols_section=$'volumes:\n'"$extra_vols"
+    fi
+    cat > "$out" <<EOF
+# 自动生成（apply 会覆盖）——多上游 registry 实例
+services:
+$svc_blocks
+  nginx:
+    depends_on:
+$deps$vols_section
+EOF
+}
+
+# ---- apply：重新生成全部配置并生效 ----
+
+cmd_apply() {
+    command -v docker >/dev/null 2>&1 || die "docker 未安装"
+    load_env
+    validate_all
+    # A1：此处可用分词迭代——validate_all 已保证 host 字符集 ^[a-z0-9][a-z0-9.-]*$（无空白/通配符），
+    # 与 validate_all 内部"未过校验前必须逐行 read"的注释呼应
+    local hosts; hosts=$(list_hosts)
+
+    # 旧写法 local tmp + trap 'rm -rf "$tmp"' EXIT——实测 macOS bash 3.2 有两处坑：
+    #   1) 局部变量随函数返回销毁，成功路径脚本退出时 set -u 报 "tmp: unbound variable"，退出码变 1
+    #   2) 只加 ${tmp:-} 兜底虽不报错，但成功路径 tmp 已销毁 → 展开为空 → 临时目录（含凭据明文）泄漏
+    # 改用全局变量：函数内 trap EXIT 本就全局生效（见下行注释），变量作用域必须与之匹配
+    APPLY_TMP=$(mktemp -d)
+    trap 'rm -rf "${APPLY_TMP:-}"' EXIT   # 函数内 trap EXIT 全局生效，脚本退出时清理
+
+    # 1) 全部生成到临时目录（失败不影响现网）
+    local host
+    for host in $hosts; do
+        generate_registry_conf "$host" "$APPLY_TMP/$host.yml"
+        generate_nginx_confs  "$host" "$APPLY_TMP/$host.http" "$APPLY_TMP/$host.loc"
+    done
+    # shellcheck disable=SC2086  # 同 A1：已过字符集校验
+    generate_override "$APPLY_TMP/override" $hosts
+    for host in $hosts; do
+        [ -s "$APPLY_TMP/$host.yml" ] && [ -s "$APPLY_TMP/$host.http" ] && [ -s "$APPLY_TMP/$host.loc" ] \
+            || die "生成 $host 配置失败（临时目录已丢弃，现网未动）"
+    done
+    [ -s "$APPLY_TMP/override" ] || die "生成 override 失败"
+
+    # 2) 切换：先清旧生成物再整批拷入；目录挂载下容器即时看到新文件（rm+cp 不受 inode 影响）。
+    # 旧注释称「原子切换」名不副实——目录级 rm+cp 非原子，中途失败（如磁盘满）会留下混合状态；
+    # 失败即被 set -e 拦下退出，重跑 apply 会从临时目录全量重生成，可自愈
+    # （旧注释：# 2) 原子切换：清掉旧生成物再拷入（目录挂载下容器即时看到新文件；rm+cp 不受 inode 影响））
+    mkdir -p "$GEN_REGISTRY" "$GEN_HTTP" "$GEN_LOC"
+    rm -f "$GEN_REGISTRY"/*.yml "$GEN_HTTP"/*.conf "$GEN_LOC"/*.conf
+    for host in $hosts; do
+        cp "$APPLY_TMP/$host.yml"  "$GEN_REGISTRY/$host.yml"
+        cp "$APPLY_TMP/$host.http" "$GEN_HTTP/$host.conf"
+        cp "$APPLY_TMP/$host.loc"  "$GEN_LOC/$host.conf"
+        # registry 配置含明文密码，落盘即 600（与声明文件同一标准）；http/loc 片段无凭据维持默认。
+        # （$APPLY_TMP 由 mktemp -d 建为 700，cp 源文件无需处理；generate_registry_conf 的
+        #   cat > 产物在 umask 022 下是 644，若只靠目录权限仍会在挂载进容器后暴露明文）
+        chmod 600 "$GEN_REGISTRY/$host.yml"
+    done
+    # override 单文件原子化：同目录 mv 原子替换，避免 compose/nginx 读到写一半的 YAML
+    # （旧形态 cp "$APPLY_TMP/override" "$OVERRIDE" 直写目标文件）
+    cp "$APPLY_TMP/override" "$OVERRIDE.tmp"
+    mv -f "$OVERRIDE.tmp" "$OVERRIDE"
+
+    # 3) 起容器：新增实例 up；nginx 若 env/depends_on 变化被 compose 自动重建（模板重新 envsubst）
+    local nginx_before nginx_after
+    nginx_before=$(docker compose ps -q nginx 2>/dev/null || true)
+    docker compose up -d --remove-orphans
+    nginx_after=$(docker compose ps -q nginx 2>/dev/null || true)
+
+    # 4) 校验 + reload：nginx -t 失败则保留旧配置继续服务（reload 失败不中断旧 worker）
+    # A2：-T 免 TTY——脚本/CI 上下文中 exec 无终端时更稳
+    if [ "$nginx_before" = "$nginx_after" ] && [ -n "$nginx_after" ]; then
+        docker compose exec -T nginx nginx -t \
+            || die "nginx -t 失败：已保留旧配置继续服务，请检查上方错误"
+        # 旧形态裸跑 reload——失败时 set -e 静默退出，用户只见 compose 原始错误不知所云；
+        # reload 失败不中断旧 worker，明确告知服务未受影响、可直接重试
+        # （旧形态: docker compose exec -T nginx nginx -s reload）
+        docker compose exec -T nginx nginx -s reload \
+            || die "reload 失败：旧 worker 继续服务不受影响，重新 apply 可重试"
+        info "nginx 已优雅 reload"
+    else
+        docker compose exec -T nginx nginx -t \
+            || die "nginx 容器已重建但配置校验失败（restart 策略会重试）"
+        # 旧文案 info "nginx 已重建（模板已按 .env 重新渲染）"——stopped 容器属启动而非重建，措辞夸大
+        info "nginx 已重建（或启动），当前磁盘配置已生效"
+    fi
+    info "apply 完成，当前上游:"
+    cmd_list
+}
+
+# ---- add / remove ----
+
+cmd_add() {
+    local host=$1; shift
+    local remoteurl="" username="" password="" force=no remoteurl_given="" password_given=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            # A3：选项缺参数值时给出可读报错（裸 $2 在 set -u 下是晦涩的 unbound variable）
+            --remoteurl) [ $# -ge 2 ] || die "--remoteurl 缺少参数值"; remoteurl=$2; remoteurl_given=yes; shift 2 ;;
+            --username)  [ $# -ge 2 ] || die "--username 缺少参数值";   username=$2;  shift 2 ;;
+            --password)  [ $# -ge 2 ] || die "--password 缺少参数值";   password=$2; password_given=yes; shift 2 ;;
+            --force)     force=yes;    shift ;;
+            *) die "未知参数: $1" ;;
+        esac
+    done
+    # A8：变量后紧跟全角括号必须 ${} 包裹（bash 3.2 多字节坑，见 validate_all 注释）
+    [[ "$host" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || die "非法 host: ${host}（小写字母/数字/./-）"
+    case "$host" in _*) die "非法 host: ${host}（不允许下划线开头）";; esac
+    local f="$REGISTRIES_DIR/$host.yml"
+    if [ -e "$f" ] && [ "$force" != "yes" ]; then
+        die "$host 已存在（改文件后 apply，或 add --force 覆盖）"
+    fi
+    # A5：写入前查归一化冲突——否则文件落盘后 apply 的 validate_all 才报错，
+    # 留下"毒声明"让后续所有 apply 持续失败，用户需手工定位删除
+    local existing norm_existing
+    norm_existing=$(norm_host "$host")
+    while IFS= read -r existing; do
+        [ -n "$existing" ] || continue
+        if [ "$existing" != "$host" ] && [ "$(norm_host "$existing")" = "$norm_existing" ]; then
+            die "归一化名冲突: ${host} 与 ${existing}（同归一化为 ${norm_existing}）"
+        fi
+    done < <(list_hosts)
+    # 旧结构 if [ -z "$remoteurl" ] 把「未传」与「显式传空串」合并进默认值分支，
+    # 其后的空值 die 永远不可达（实测 add ghcr.io --remoteurl "" 落盘默认值且 exit 0），
+    # A4 注释「显式传入空 remoteurl 在写入前拒绝」与实际行为相反——按 given 标记位拆开：
+    # 旧形态:
+    # if [ -z "$remoteurl" ]; then
+    #     if [ "$host" = "docker.io" ]; then remoteurl="https://registry-1.docker.io"
+    #     else remoteurl="https://$host"; fi
+    # fi
+    # [ -n "$remoteurl" ] || die "remoteurl 不能为空"
+    if [ -n "$remoteurl_given" ]; then
+        # 显式传入（含空串）在写入前拒绝——写入后才报错会留下毒声明
+        [ -n "$remoteurl" ] || die "remoteurl 不能为空"
+    else
+        # docker.io 特例：API 端点是 registry-1.docker.io
+        if [ "$host" = "docker.io" ]; then remoteurl="https://registry-1.docker.io"
+        else remoteurl="https://$host"; fi
+    fi
+    # --password 无 --username：凭据会被静默丢弃（声明只在有 username 时才写 password）——直接拒绝。
+    # 旧形态 warn 嵌在下方 username 块内，add x --password y 零警告、声明无 password、上游静默匿名；
+    # 用 if 形式（对齐 validate_all 的 set -e 规避写法，不用 [ ] && die 链）
+    if [ -n "$password" ] && [ -z "$username" ]; then
+        die "--password 需与 --username 同时使用"
+    fi
+    # 写盘前预检默认上游声明存在——否则新装机器先 add ghcr.io 会落盘成功、直到 apply 的
+    # validate_all 才报错（host 本身是 docker.io 时豁免：它就是要补的那块）
+    if [ "$host" != "$DEFAULT_UPSTREAM" ] && [ ! -f "$REGISTRIES_DIR/${DEFAULT_UPSTREAM}.yml" ]; then
+        die "缺少 ${DEFAULT_UPSTREAM} 声明，先执行: ./manage-upstreams.sh add ${DEFAULT_UPSTREAM}"
+    fi
+    # --password 显式传入（含空串）：空值直接拒绝（对齐 remoteurl 的 fail-closed）；
+    # history 提示必须在重定向块外发——warn 走 stdout，旧位置在下方 { } > "$f" 内，
+    # 会被写进声明文件且终端不可见；且只应对命令行传入的密码提示（交互 read 的不应触发）
+    if [ -n "$password_given" ]; then
+        [ -n "$password" ] || die "--password 不能为空"
+        warn "--password 经命令行传入，可能进入 shell history"
+    fi
+    # A6：交互输入需 TTY（stty 在非终端 stdin 上报错）；管道/CI 场景引导用 --password
+    # 旧写法把 TTY 检查/密码读取放在下方 { } > "$f" 重定向块内——die 时文件已被截断创建，
+    # 留下 "username 无 password" 的半截声明（且未 chmod 600），后续 apply 会被
+    # generate_registry_conf 静默降级为匿名上游；对齐 A4/A5 的"写盘前 fail-closed"原则，
+    # 凭据校验与交互读取全部前移到任何磁盘写入之前
+    if [ -n "$username" ] && [ -z "$password" ]; then
+        [ -t 0 ] || die "需交互终端输入密码（非交互场景用 --password）"
+        printf '密码（不回显）: ' >&2
+        stty -echo
+        # 边界：输入流提前关闭（Ctrl-D/管道断开）时 read 非零——set -e 下会静默退出，
+        # 且必须先恢复终端回显再 die，否则用户 shell 会话残留 -echo 状态（输入不可见）
+        IFS= read -r password || { stty echo; echo >&2; die "密码读取失败（输入流已关闭）"; }
+        stty echo; echo >&2
+        [ -n "$password" ] || die "密码为空"
+    fi
+    # 值含 " #"：parse_flat_yaml 对行内注释 fail-closed（首个 " #" 起整行丢弃）——声明落盘后
+    # apply 会静默缺 remoteurl/凭据并降级匿名；放在密码交互读取之后，CLI 传入与终端键入的值都能覆盖
+    case "$remoteurl$username$password" in *' #'*) die "参数值含 ' #'（与行内注释语法冲突，请调整）" ;; esac
+    # 环境预检前移（与 cmd_remove 对称）——旧形态先落盘声明、cmd_apply 才报环境错误，
+    # 留下待处理声明且报错位置靠后（预检项与 cmd_apply 入口一致）
+    command -v docker >/dev/null 2>&1 || die "docker 未安装"
+    [ -f .env ] || die "缺少 .env，先执行: cp .env.example .env"
+    mkdir -p "$REGISTRIES_DIR"
+    # 旧形态 { } > "$f" 以当前 umask（022 → 644）创建文件，chmod 600 前存在明文窗口；
+    # 改子壳内 umask 077，从创建即 600 且不外泄到调用方；chmod 600 保留作冗余兜底
+    (
+        umask 077
+        {
+            echo "# 上游声明：文件名(去 .yml) = 路由前缀 = 实例名；改完执行 ./manage-upstreams.sh apply"
+            echo "remoteurl: $remoteurl"
+            if [ -n "$username" ]; then
+                echo "username: $username"
+                # 旧写法此处内嵌 warn "--password 经命令行传入..."——warn 走 stdout，
+                # 在 { } > "$f" 重定向内会被写进声明文件且终端看不到（已前移到写盘前）
+                echo "password: $password"
+            fi
+        } > "$f"
+    )
+    chmod 600 "$f"
+    # 旧形态（已被上方 umask 子壳取代）:
+    # {
+    #     echo "# 上游声明：文件名(去 .yml) = 路由前缀 = 实例名；改完执行 ./manage-upstreams.sh apply"
+    #     echo "remoteurl: $remoteurl"
+    #     if [ -n "$username" ]; then
+    #         echo "username: $username"
+    #         echo "password: $password"
+    #     fi
+    # } > "$f"
+    # chmod 600 "$f"
+    # 同 A8：$f 后紧跟全角逗号，裸 $f 会被 bash 3.2 当作 "f，" 变量名 → unbound variable
+    info "已写入 ${f}，开始生效..."
+    cmd_apply
+}
+
+cmd_remove() {
+    local host=$1
+    # 与 add 对称的字符集校验——防 remove ../x 之类路径逃逸（A8 全角括号规则同 add）
+    [[ "$host" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || die "非法 host: ${host}（小写字母/数字/./-）"
+    case "$host" in _*) die "非法 host: ${host}（不允许下划线开头）";; esac
+    [ "$host" = "$DEFAULT_UPSTREAM" ] && die "不允许 remove 默认上游 $DEFAULT_UPSTREAM"
+    # 环境预检前移——旧形态 rm 先于环境检查：声明已删、cmd_apply 才报环境错误，
+    # 会被误读为「remove 失败」且声明无法找回（预检项与 cmd_apply 入口一致）
+    command -v docker >/dev/null 2>&1 || die "docker 未安装"
+    [ -f .env ] || die "缺少 .env，先执行: cp .env.example .env"
+    local f="$REGISTRIES_DIR/$host.yml"
+    [ -f "$f" ] || die "$host 不存在"
+    rm "$f"
+    cmd_apply
+    # 边界：容器被 --remove-orphans 清掉，但数据卷（缓存）默认保留
+    # A7：不给 jq 硬依赖（macOS 默认无 jq）——volume ls 按卷名特征过滤即可
+    warn "数据卷 registry-data-$(norm_host "$host") 已保留；确认清理可执行:"
+    warn "  docker volume rm \$(docker volume ls -q | grep registry-data-$(norm_host "$host")\$)"
+}
+
+main() {
+    if [ $# -eq 0 ]; then usage; exit 0; fi
+    local cmd=$1; shift
+    case "$cmd" in
+        list)                        cmd_list ;;
+        add)    [ $# -ge 1 ] || die "用法: $0 add <host> [选项]"; cmd_add "$@" ;;
+        remove) [ $# -eq 1 ] || die "用法: $0 remove <host>";     cmd_remove "$1" ;;
+        apply)                        cmd_apply ;;
+        help|-h|--help)              usage ;;
+        # 同 A8：$cmd 后紧跟全角括号，裸 $cmd 会被 bash 3.2 当作 "cmd（" 变量名 → unbound variable
+        # （旧写法 die "未知命令: $cmd（见 help）" 实测报 "cmd錯: unbound variable"）
+        *) die "未知命令: ${cmd}（见 help）" ;;
+    esac
+}
+
+main "$@"

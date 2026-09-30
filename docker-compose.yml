@@ -1,39 +1,43 @@
 version: '3.8'
 
 services:
-  # Docker Registry (proxy 模式)
-  registry:
-    image: registry:2
-    container_name: docker-registry-proxy
-    restart: unless-stopped
-    environment:
-      # Registry 配置文件路径
-      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
-      # 启用删除功能（可选）
-      REGISTRY_STORAGE_DELETE_ENABLED: "true"
-      # 日志级别
-      # REGISTRY_LOG_LEVEL: debug
-      REGISTRY_LOG_LEVEL: info
-    volumes:
-      # 挂载配置文件
-      - ./config/registry-config.yml:/etc/docker/registry/config.yml:ro
-      # 挂载认证文件
-      - ./auth/htpasswd:/auth/htpasswd:ro
-      # 数据目录（虽然是代理模式，但仍需要临时存储）
-      - registry-data:/var/lib/registry
-    networks:
-      - internal
-    healthcheck:
-      test: ["CMD-SHELL", "code=$$(wget -S --spider -q http://localhost:5000/v2/ 2>&1 | awk '/^  HTTP\\//{print $$2; exit}'); [ \"$$code\" = \"200\" ] || [ \"$$code\" = \"401\" ]"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-    # 限制容器日志大小
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+  # 【多上游改造】registry 服务已移至 manage-upstreams.sh 生成的 docker-compose.override.yml
+  # （默认上游 docker.io 实例沿用服务名 registry / 容器名 docker-registry-proxy / 卷 registry-data）
+  # 以下为旧的单上游静态定义，按用户规则注释保留：
+  #
+  #   # Docker Registry (proxy 模式)
+  #   registry:
+  #     image: registry:2
+  #     container_name: docker-registry-proxy
+  #     restart: unless-stopped
+  #     environment:
+  #       # Registry 配置文件路径
+  #       REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
+  #       # 启用删除功能（可选）
+  #       REGISTRY_STORAGE_DELETE_ENABLED: "true"
+  #       # 日志级别
+  #       # REGISTRY_LOG_LEVEL: debug
+  #       REGISTRY_LOG_LEVEL: info
+  #     volumes:
+  #       # 挂载配置文件
+  #       - ./config/registry-config.yml:/etc/docker/registry/config.yml:ro
+  #       # 挂载认证文件
+  #       - ./auth/htpasswd:/auth/htpasswd:ro
+  #       # 数据目录（虽然是代理模式，但仍需要临时存储）
+  #       - registry-data:/var/lib/registry
+  #     networks:
+  #       - internal
+  #     healthcheck:
+  #       test: ["CMD-SHELL", "code=$$(wget -S --spider -q http://localhost:5000/v2/ 2>&1 | awk '/^  HTTP\\//{print $$2; exit}'); [ \"$$code\" = \"200\" ] || [ \"$$code\" = \"401\" ]"]
+  #       interval: 30s
+  #       timeout: 10s
+  #       retries: 3
+  #     # 限制容器日志大小
+  #     logging:
+  #       driver: "json-file"
+  #       options:
+  #         max-size: "10m"
+  #         max-file: "3"
 
   # Nginx 反向代理 + Rate Limiting
   nginx:
@@ -54,6 +58,10 @@ services:
       - nginx-logs:/var/log/nginx
       # Logrotate 配置
       - ./config/logrotate.conf:/etc/logrotate.d/nginx:ro
+      # 多上游：生成的 nginx 片段（upstream 池 + 前缀 location）
+      - ./config/generated/nginx:/etc/nginx/generated:ro
+      # 多上游：location 共用 snippet
+      - ./config/nginx-snippets:/etc/nginx/snippets:ro
     networks:
       - internal
       - ${TRAEFIK_NETWORK:-traefik-net}
