@@ -344,3 +344,169 @@ $svc_blocks
 $deps$vols_section
 EOF
 }
+
+# ---- apply：重新生成全部配置并生效 ----
+
+cmd_apply() {
+    command -v docker >/dev/null 2>&1 || die "docker 未安装"
+    load_env
+    validate_all
+    # A1：此处可用分词迭代——validate_all 已保证 host 字符集 ^[a-z0-9][a-z0-9.-]*$（无空白/通配符），
+    # 与 validate_all 内部"未过校验前必须逐行 read"的注释呼应
+    local hosts; hosts=$(list_hosts)
+
+    # 旧写法 local tmp + trap 'rm -rf "$tmp"' EXIT——实测 macOS bash 3.2 有两处坑：
+    #   1) 局部变量随函数返回销毁，成功路径脚本退出时 set -u 报 "tmp: unbound variable"，退出码变 1
+    #   2) 只加 ${tmp:-} 兜底虽不报错，但成功路径 tmp 已销毁 → 展开为空 → 临时目录（含凭据明文）泄漏
+    # 改用全局变量：函数内 trap EXIT 本就全局生效（见下行注释），变量作用域必须与之匹配
+    APPLY_TMP=$(mktemp -d)
+    trap 'rm -rf "${APPLY_TMP:-}"' EXIT   # 函数内 trap EXIT 全局生效，脚本退出时清理
+
+    # 1) 全部生成到临时目录（失败不影响现网）
+    local host
+    for host in $hosts; do
+        generate_registry_conf "$host" "$APPLY_TMP/$host.yml"
+        generate_nginx_confs  "$host" "$APPLY_TMP/$host.http" "$APPLY_TMP/$host.loc"
+    done
+    # shellcheck disable=SC2086  # 同 A1：已过字符集校验
+    generate_override "$APPLY_TMP/override" $hosts
+    for host in $hosts; do
+        [ -s "$APPLY_TMP/$host.yml" ] && [ -s "$APPLY_TMP/$host.http" ] && [ -s "$APPLY_TMP/$host.loc" ] \
+            || die "生成 $host 配置失败（临时目录已丢弃，现网未动）"
+    done
+    [ -s "$APPLY_TMP/override" ] || die "生成 override 失败"
+
+    # 2) 原子切换：清掉旧生成物再拷入（目录挂载下容器即时看到新文件；rm+cp 不受 inode 影响）
+    mkdir -p "$GEN_REGISTRY" "$GEN_HTTP" "$GEN_LOC"
+    rm -f "$GEN_REGISTRY"/*.yml "$GEN_HTTP"/*.conf "$GEN_LOC"/*.conf
+    for host in $hosts; do
+        cp "$APPLY_TMP/$host.yml"  "$GEN_REGISTRY/$host.yml"
+        cp "$APPLY_TMP/$host.http" "$GEN_HTTP/$host.conf"
+        cp "$APPLY_TMP/$host.loc"  "$GEN_LOC/$host.conf"
+    done
+    cp "$APPLY_TMP/override" "$OVERRIDE"
+
+    # 3) 起容器：新增实例 up；nginx 若 env/depends_on 变化被 compose 自动重建（模板重新 envsubst）
+    local nginx_before nginx_after
+    nginx_before=$(docker compose ps -q nginx 2>/dev/null || true)
+    docker compose up -d --remove-orphans
+    nginx_after=$(docker compose ps -q nginx 2>/dev/null || true)
+
+    # 4) 校验 + reload：nginx -t 失败则保留旧配置继续服务（reload 失败不中断旧 worker）
+    # A2：-T 免 TTY——脚本/CI 上下文中 exec 无终端时更稳
+    if [ "$nginx_before" = "$nginx_after" ] && [ -n "$nginx_after" ]; then
+        docker compose exec -T nginx nginx -t \
+            || die "nginx -t 失败：已保留旧配置继续服务，请检查上方错误"
+        docker compose exec -T nginx nginx -s reload
+        info "nginx 已优雅 reload"
+    else
+        docker compose exec -T nginx nginx -t \
+            || die "nginx 容器已重建但配置校验失败（restart 策略会重试）"
+        info "nginx 已重建（模板已按 .env 重新渲染）"
+    fi
+    info "apply 完成，当前上游:"
+    cmd_list
+}
+
+# ---- add / remove ----
+
+cmd_add() {
+    local host=$1; shift
+    local remoteurl="" username="" password="" force=no
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            # A3：选项缺参数值时给出可读报错（裸 $2 在 set -u 下是晦涩的 unbound variable）
+            --remoteurl) [ $# -ge 2 ] || die "--remoteurl 缺少参数值"; remoteurl=$2; shift 2 ;;
+            --username)  [ $# -ge 2 ] || die "--username 缺少参数值";   username=$2;  shift 2 ;;
+            --password)  [ $# -ge 2 ] || die "--password 缺少参数值";   password=$2;  shift 2 ;;
+            --force)     force=yes;    shift ;;
+            *) die "未知参数: $1" ;;
+        esac
+    done
+    # A8：变量后紧跟全角括号必须 ${} 包裹（bash 3.2 多字节坑，见 validate_all 注释）
+    [[ "$host" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || die "非法 host: ${host}（小写字母/数字/./-）"
+    case "$host" in _*) die "非法 host: ${host}（不允许下划线开头）";; esac
+    local f="$REGISTRIES_DIR/$host.yml"
+    if [ -e "$f" ] && [ "$force" != "yes" ]; then
+        die "$host 已存在（改文件后 apply，或 add --force 覆盖）"
+    fi
+    # A5：写入前查归一化冲突——否则文件落盘后 apply 的 validate_all 才报错，
+    # 留下"毒声明"让后续所有 apply 持续失败，用户需手工定位删除
+    local existing norm_existing
+    norm_existing=$(norm_host "$host")
+    while IFS= read -r existing; do
+        [ -n "$existing" ] || continue
+        if [ "$existing" != "$host" ] && [ "$(norm_host "$existing")" = "$norm_existing" ]; then
+            die "归一化名冲突: ${host} 与 ${existing}（同归一化为 ${norm_existing}）"
+        fi
+    done < <(list_hosts)
+    # docker.io 特例：API 端点是 registry-1.docker.io
+    if [ -z "$remoteurl" ]; then
+        if [ "$host" = "docker.io" ]; then remoteurl="https://registry-1.docker.io"
+        else remoteurl="https://$host"; fi
+    fi
+    # A4：显式传入空 remoteurl 在写入前拒绝（写入后 apply 才报错同样会留下毒声明）
+    [ -n "$remoteurl" ] || die "remoteurl 不能为空"
+    # A6：交互输入需 TTY（stty 在非终端 stdin 上报错）；管道/CI 场景引导用 --password
+    # 旧写法把 TTY 检查/密码读取放在下方 { } > "$f" 重定向块内——die 时文件已被截断创建，
+    # 留下 "username 无 password" 的半截声明（且未 chmod 600），后续 apply 会被
+    # generate_registry_conf 静默降级为匿名上游；对齐 A4/A5 的"写盘前 fail-closed"原则，
+    # 凭据校验与交互读取全部前移到任何磁盘写入之前
+    if [ -n "$username" ] && [ -z "$password" ]; then
+        [ -t 0 ] || die "需交互终端输入密码（非交互场景用 --password）"
+        printf '密码（不回显）: ' >&2
+        stty -echo
+        # 边界：输入流提前关闭（Ctrl-D/管道断开）时 read 非零——set -e 下会静默退出，
+        # 且必须先恢复终端回显再 die，否则用户 shell 会话残留 -echo 状态（输入不可见）
+        IFS= read -r password || { stty echo; echo >&2; die "密码读取失败（输入流已关闭）"; }
+        stty echo; echo >&2
+        [ -n "$password" ] || die "密码为空"
+    fi
+    mkdir -p "$REGISTRIES_DIR"
+    {
+        echo "# 上游声明：文件名(去 .yml) = 路由前缀 = 实例名；改完执行 ./manage-upstreams.sh apply"
+        echo "remoteurl: $remoteurl"
+        if [ -n "$username" ]; then
+            echo "username: $username"
+            # 旧写法此处分支内做 TTY 检查与密码读取（已前移，见上）；非交互时此分支已不可达
+            if [ -n "$password" ]; then
+                warn "--password 经命令行传入，可能进入 shell history"
+            fi
+            echo "password: $password"
+        fi
+    } > "$f"
+    chmod 600 "$f"
+    # 同 A8：$f 后紧跟全角逗号，裸 $f 会被 bash 3.2 当作 "f，" 变量名 → unbound variable
+    info "已写入 ${f}，开始生效..."
+    cmd_apply
+}
+
+cmd_remove() {
+    local host=$1
+    [ "$host" = "$DEFAULT_UPSTREAM" ] && die "不允许 remove 默认上游 $DEFAULT_UPSTREAM"
+    local f="$REGISTRIES_DIR/$host.yml"
+    [ -f "$f" ] || die "$host 不存在"
+    rm "$f"
+    cmd_apply
+    # 边界：容器被 --remove-orphans 清掉，但数据卷（缓存）默认保留
+    # A7：不给 jq 硬依赖（macOS 默认无 jq）——volume ls 按卷名特征过滤即可
+    warn "数据卷 registry-data-$(norm_host "$host") 已保留；确认清理可执行:"
+    warn "  docker volume rm \$(docker volume ls -q | grep registry-data-$(norm_host "$host")\$)"
+}
+
+main() {
+    if [ $# -eq 0 ]; then usage; exit 0; fi
+    local cmd=$1; shift
+    case "$cmd" in
+        list)                        cmd_list ;;
+        add)    [ $# -ge 1 ] || die "用法: $0 add <host> [选项]"; cmd_add "$@" ;;
+        remove) [ $# -eq 1 ] || die "用法: $0 remove <host>";     cmd_remove "$1" ;;
+        apply)                        cmd_apply ;;
+        help|-h|--help)              usage ;;
+        # 同 A8：$cmd 后紧跟全角括号，裸 $cmd 会被 bash 3.2 当作 "cmd（" 变量名 → unbound variable
+        # （旧写法 die "未知命令: $cmd（见 help）" 实测报 "cmd錯: unbound variable"）
+        *) die "未知命令: ${cmd}（见 help）" ;;
+    esac
+}
+
+main "$@"
