@@ -123,6 +123,14 @@ volume_name() {
 # nginx 正则转义（点 → \.）；与其余取值函数一致按行输出（命令替换会剥掉换行）
 regex_escape() { printf '%s\n' "$1" | sed 's/[.]/\\./g'; }
 
+# YAML 双引号纯量：转义 \ 与 " 后包裹——挡住值含 ": "、前导 &、不成对引号等破坏非引号纯量的字符
+yaml_quote() {
+    local s=$1
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '"%s"' "$s"
+}
+
 list_hosts() {
     [ -d "$REGISTRIES_DIR" ] || return 0
     # /^$/d：basename 恰为 ".yml" 的文件会产出空行
@@ -188,19 +196,28 @@ generate_registry_conf() {
     remoteurl=$(get_field "$REGISTRIES_DIR/$host.yml" remoteurl)
     user=$(get_field "$REGISTRIES_DIR/$host.yml" username)
     pass=$(get_field "$REGISTRIES_DIR/$host.yml" password)
-    # 边界：username/password 必须成对，只有用户名无密码时按匿名处理并警告
+    # 边界：username/password 必须成对，半边缺失时按匿名处理并警告（仅手改 yml 会出现，add 不会写出这种状态）
     if [ -n "$user" ] && [ -z "$pass" ]; then
         warn "$host: 有 username 无 password，按匿名上游处理"
         user=""
     fi
-    if [ -n "$user" ]; then
-        auth_block=$'\n  username: '"$user"$'\n  password: '"$pass"
+    # 旧写法只挡了"有 username 无 password"一侧；补对称分支，否则孤密码会被静默写入配置
+    if [ -n "$pass" ] && [ -z "$user" ]; then
+        warn "$host: 有 password 无 username，按匿名上游处理"
+        pass=""
     fi
+    # 旧写法 auth_block 直接内插裸值（username: $user）——密码含 ": " 即产出非法 YAML，
+    # 前导 & 会被解析为锚点致密码变 null；统一经 yaml_quote 包裹
+    if [ -n "$user" ]; then
+        auth_block=$'\n  username: '"$(yaml_quote "$user")"$'\n  password: '"$(yaml_quote "$pass")"
+    fi
+    # 旧写法 heredoc 内裸内插（level: ${REGISTRY_LOG_LEVEL:-info} / remoteurl: $remoteurl），
+    # 同样有 ": " / & / 引号破坏 YAML 的问题；改经 yaml_quote
     cat > "$out" <<EOF
 # 自动生成（apply 会覆盖）——上游: $host
 version: 0.1
 log:
-  level: ${REGISTRY_LOG_LEVEL:-info}
+  level: $(yaml_quote "${REGISTRY_LOG_LEVEL:-info}")
   formatter: text
   fields:
     service: registry
@@ -224,7 +241,7 @@ health:
     interval: 10s
     threshold: 3
 proxy:
-  remoteurl: $remoteurl$auth_block
+  remoteurl: $(yaml_quote "$remoteurl")$auth_block
 auth:
   htpasswd:
     realm: "Docker Registry Proxy"
@@ -242,6 +259,10 @@ generate_nginx_confs() {
     escaped=$(regex_escape "$host")
     burst=${RATE_LIMIT_BURST:-20}
     conn=${RATE_LIMIT_CONN:-10}
+    # 边界：非数字值原样烘焙只会在容器内 nginx -t 才暴露（报错行号对应合并后配置，难定位）——生成期直接拒绝
+    # 旧写法无校验；case 字符类匹配 macOS bash 3.2 可用（regex 需 [[ =~ ]]，此处不必）
+    case "$burst" in ''|*[!0-9]*) die "RATE_LIMIT_BURST 非法: ${burst}（需为非负整数）" ;; esac
+    case "$conn" in ''|*[!0-9]*) die "RATE_LIMIT_CONN 非法: ${conn}（需为非负整数）" ;; esac
 
     cat > "$http_out" <<EOF
 # 自动生成（apply 会覆盖）——上游: $host
@@ -261,7 +282,7 @@ EOF
 # 自动生成（apply 会覆盖）——上游: $host
 location ~ ^/v2/($escaped)(?<prefix_rest>/.*)?\$ {
     include /etc/nginx/snippets/proxy-common.conf;
-    # 裸前缀（/v2/ghcr.io）兜底：避免 rewrite 出 /v2 被 301 丢前缀
+    # 裸前缀（/v2/${host}）兜底：避免 rewrite 出 /v2 被 301 丢前缀（花括号必加，坑见 validate_all 注释）
     if (\$prefix_rest = "") { return 404; }
     # 限流值为生成时烘焙的字面量；改 .env 后需重新 apply
     limit_req zone=registry_limit burst=$burst nodelay;
@@ -276,7 +297,7 @@ EOF
 # 每上游一个 registry 实例；nginx 追加 depends_on（启动时 DNS 名已存在，upstream 解析不失败）
 generate_override() {
     local out=$1; shift
-    local host svc cname vol extra_vols="" svc_blocks="" deps=""
+    local host svc cname vol extra_vols="" svc_blocks="" deps="" vols_section=""
     for host in "$@"; do
         svc=$(service_name "$host")
         cname=$(container_name "$host")
@@ -309,14 +330,17 @@ generate_override() {
         max-file: \"3\"
 "$'\n'
     done
+    # 旧写法恒输出 volumes:（$extra_vols）——仅默认上游时是尾随的空 null 段（compose 容忍但难看）；
+    # 改为仅存在非默认上游时才组装并输出 volumes 段
+    if [ -n "$extra_vols" ]; then
+        vols_section=$'volumes:\n'"$extra_vols"
+    fi
     cat > "$out" <<EOF
 # 自动生成（apply 会覆盖）——多上游 registry 实例
 services:
 $svc_blocks
   nginx:
     depends_on:
-$deps
-volumes:
-$extra_vols
+$deps$vols_section
 EOF
 }
