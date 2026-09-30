@@ -376,15 +376,25 @@ cmd_apply() {
     done
     [ -s "$APPLY_TMP/override" ] || die "生成 override 失败"
 
-    # 2) 原子切换：清掉旧生成物再拷入（目录挂载下容器即时看到新文件；rm+cp 不受 inode 影响）
+    # 2) 切换：先清旧生成物再整批拷入；目录挂载下容器即时看到新文件（rm+cp 不受 inode 影响）。
+    # 旧注释称「原子切换」名不副实——目录级 rm+cp 非原子，中途失败（如磁盘满）会留下混合状态；
+    # 失败即被 set -e 拦下退出，重跑 apply 会从临时目录全量重生成，可自愈
+    # （旧注释：# 2) 原子切换：清掉旧生成物再拷入（目录挂载下容器即时看到新文件；rm+cp 不受 inode 影响））
     mkdir -p "$GEN_REGISTRY" "$GEN_HTTP" "$GEN_LOC"
     rm -f "$GEN_REGISTRY"/*.yml "$GEN_HTTP"/*.conf "$GEN_LOC"/*.conf
     for host in $hosts; do
         cp "$APPLY_TMP/$host.yml"  "$GEN_REGISTRY/$host.yml"
         cp "$APPLY_TMP/$host.http" "$GEN_HTTP/$host.conf"
         cp "$APPLY_TMP/$host.loc"  "$GEN_LOC/$host.conf"
+        # registry 配置含明文密码，落盘即 600（与声明文件同一标准）；http/loc 片段无凭据维持默认。
+        # （$APPLY_TMP 由 mktemp -d 建为 700，cp 源文件无需处理；generate_registry_conf 的
+        #   cat > 产物在 umask 022 下是 644，若只靠目录权限仍会在挂载进容器后暴露明文）
+        chmod 600 "$GEN_REGISTRY/$host.yml"
     done
-    cp "$APPLY_TMP/override" "$OVERRIDE"
+    # override 单文件原子化：同目录 mv 原子替换，避免 compose/nginx 读到写一半的 YAML
+    # （旧形态 cp "$APPLY_TMP/override" "$OVERRIDE" 直写目标文件）
+    cp "$APPLY_TMP/override" "$OVERRIDE.tmp"
+    mv -f "$OVERRIDE.tmp" "$OVERRIDE"
 
     # 3) 起容器：新增实例 up；nginx 若 env/depends_on 变化被 compose 自动重建（模板重新 envsubst）
     local nginx_before nginx_after
@@ -397,12 +407,17 @@ cmd_apply() {
     if [ "$nginx_before" = "$nginx_after" ] && [ -n "$nginx_after" ]; then
         docker compose exec -T nginx nginx -t \
             || die "nginx -t 失败：已保留旧配置继续服务，请检查上方错误"
-        docker compose exec -T nginx nginx -s reload
+        # 旧形态裸跑 reload——失败时 set -e 静默退出，用户只见 compose 原始错误不知所云；
+        # reload 失败不中断旧 worker，明确告知服务未受影响、可直接重试
+        # （旧形态: docker compose exec -T nginx nginx -s reload）
+        docker compose exec -T nginx nginx -s reload \
+            || die "reload 失败：旧 worker 继续服务不受影响，重新 apply 可重试"
         info "nginx 已优雅 reload"
     else
         docker compose exec -T nginx nginx -t \
             || die "nginx 容器已重建但配置校验失败（restart 策略会重试）"
-        info "nginx 已重建（模板已按 .env 重新渲染）"
+        # 旧文案 info "nginx 已重建（模板已按 .env 重新渲染）"——stopped 容器属启动而非重建，措辞夸大
+        info "nginx 已重建（或启动），当前磁盘配置已生效"
     fi
     info "apply 完成，当前上游:"
     cmd_list
@@ -463,6 +478,11 @@ cmd_add() {
     if [ -n "$password" ] && [ -z "$username" ]; then
         die "--password 需与 --username 同时使用"
     fi
+    # 写盘前预检默认上游声明存在——否则新装机器先 add ghcr.io 会落盘成功、直到 apply 的
+    # validate_all 才报错（host 本身是 docker.io 时豁免：它就是要补的那块）
+    if [ "$host" != "$DEFAULT_UPSTREAM" ] && [ ! -f "$REGISTRIES_DIR/${DEFAULT_UPSTREAM}.yml" ]; then
+        die "缺少 ${DEFAULT_UPSTREAM} 声明，先执行: ./manage-upstreams.sh add ${DEFAULT_UPSTREAM}"
+    fi
     # --password 显式传入（含空串）：空值直接拒绝（对齐 remoteurl 的 fail-closed）；
     # history 提示必须在重定向块外发——warn 走 stdout，旧位置在下方 { } > "$f" 内，
     # 会被写进声明文件且终端不可见；且只应对命令行传入的密码提示（交互 read 的不应触发）
@@ -485,18 +505,36 @@ cmd_add() {
         stty echo; echo >&2
         [ -n "$password" ] || die "密码为空"
     fi
+    # 值含 " #"：parse_flat_yaml 对行内注释 fail-closed（首个 " #" 起整行丢弃）——声明落盘后
+    # apply 会静默缺 remoteurl/凭据并降级匿名；放在密码交互读取之后，CLI 传入与终端键入的值都能覆盖
+    case "$remoteurl$username$password" in *' #'*) die "参数值含 ' #'（与行内注释语法冲突，请调整）" ;; esac
     mkdir -p "$REGISTRIES_DIR"
-    {
-        echo "# 上游声明：文件名(去 .yml) = 路由前缀 = 实例名；改完执行 ./manage-upstreams.sh apply"
-        echo "remoteurl: $remoteurl"
-        if [ -n "$username" ]; then
-            echo "username: $username"
-            # 旧写法此处内嵌 warn "--password 经命令行传入..."——warn 走 stdout，
-            # 在 { } > "$f" 重定向内会被写进声明文件且终端看不到（已前移到写盘前）
-            echo "password: $password"
-        fi
-    } > "$f"
+    # 旧形态 { } > "$f" 以当前 umask（022 → 644）创建文件，chmod 600 前存在明文窗口；
+    # 改子壳内 umask 077，从创建即 600 且不外泄到调用方；chmod 600 保留作冗余兜底
+    (
+        umask 077
+        {
+            echo "# 上游声明：文件名(去 .yml) = 路由前缀 = 实例名；改完执行 ./manage-upstreams.sh apply"
+            echo "remoteurl: $remoteurl"
+            if [ -n "$username" ]; then
+                echo "username: $username"
+                # 旧写法此处内嵌 warn "--password 经命令行传入..."——warn 走 stdout，
+                # 在 { } > "$f" 重定向内会被写进声明文件且终端看不到（已前移到写盘前）
+                echo "password: $password"
+            fi
+        } > "$f"
+    )
     chmod 600 "$f"
+    # 旧形态（已被上方 umask 子壳取代）:
+    # {
+    #     echo "# 上游声明：文件名(去 .yml) = 路由前缀 = 实例名；改完执行 ./manage-upstreams.sh apply"
+    #     echo "remoteurl: $remoteurl"
+    #     if [ -n "$username" ]; then
+    #         echo "username: $username"
+    #         echo "password: $password"
+    #     fi
+    # } > "$f"
+    # chmod 600 "$f"
     # 同 A8：$f 后紧跟全角逗号，裸 $f 会被 bash 3.2 当作 "f，" 变量名 → unbound variable
     info "已写入 ${f}，开始生效..."
     cmd_apply
@@ -504,7 +542,14 @@ cmd_add() {
 
 cmd_remove() {
     local host=$1
+    # 与 add 对称的字符集校验——防 remove ../x 之类路径逃逸（A8 全角括号规则同 add）
+    [[ "$host" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || die "非法 host: ${host}（小写字母/数字/./-）"
+    case "$host" in _*) die "非法 host: ${host}（不允许下划线开头）";; esac
     [ "$host" = "$DEFAULT_UPSTREAM" ] && die "不允许 remove 默认上游 $DEFAULT_UPSTREAM"
+    # 环境预检前移——旧形态 rm 先于环境检查：声明已删、cmd_apply 才报环境错误，
+    # 会被误读为「remove 失败」且声明无法找回（预检项与 cmd_apply 入口一致）
+    command -v docker >/dev/null 2>&1 || die "docker 未安装"
+    [ -f .env ] || die "缺少 .env，先执行: cp .env.example .env"
     local f="$REGISTRIES_DIR/$host.yml"
     [ -f "$f" ] || die "$host 不存在"
     rm "$f"
