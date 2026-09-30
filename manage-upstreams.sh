@@ -50,7 +50,17 @@ load_env() {
     local k v
     while IFS='=' read -r k v; do
         case "$k" in ''|\#*) continue ;; esac
-        export "$k=$v"
+        # 值清洗顺序（确定性，对齐 compose 语义）：去行尾 CR → 截掉行内注释（首个 " #" 起）→ 去一层成对引号
+        # 已知取舍：带引号的值自身含 " #" 时会被截断（注释先于引号处理）
+        v="${v%$'\r'}"
+        v="${v%% \#*}"
+        case "$v" in
+            \"*\") v="${v#\"}"; v="${v%\"}" ;;
+            \'*\') v="${v#\'}"; v="${v%\'}" ;;
+        esac
+        # env 优先：调用方已设置（含空值）的变量不被 .env 覆盖
+        # （目录变量的测试覆盖契约依赖此语义；也防止 .env 意外覆盖 PATH 等）
+        if [ -z "${!k+x}" ]; then export "$k=$v"; fi
     done < <(grep -E '^[A-Za-z_][A-Za-z0-9_]*=' .env)
     # 边界：DEFAULT_UPSTREAM 仅支持 docker.io（默认 location 的 library/ 补全语义）
     [ "${DEFAULT_UPSTREAM:-docker.io}" = "docker.io" ] \
@@ -58,8 +68,10 @@ load_env() {
 }
 
 # 平面 YAML 解析：输出 "key<TAB>value"；按首个冒号切分（remoteurl 值含 ://）；跳过注释/空行
+# 值规则：含 " #"（行内注释）→ 整行拒绝（fail-closed：不支持值内注释，避免静默截断 URL）；
+#        成对引号去一层；重复键由 get_field 取最后值（对齐 YAML 覆盖语义）
 parse_flat_yaml() {
-    awk '
+    awk -v sq="'" '
         function trim(s) { gsub(/^[[:space:]]+|[[:space:]]+$/, "", s); return s }
         /^[[:space:]]*#/ { next }
         /^[[:space:]]*$/ { next }
@@ -69,15 +81,19 @@ parse_flat_yaml() {
             key = tolower(trim(substr($0, 1, i - 1)))
             val = trim(substr($0, i + 1))
             if (key == "" || val == "") next
+            if (val ~ / #/) next
+            q = substr(val, 1, 1)
+            if (length(val) >= 2 && (q == "\"" || q == sq) && substr(val, length(val)) == q)
+                val = substr(val, 2, length(val) - 2)
             print key "\t" val
         }
     ' "$1"
 }
 
-# get_field <file> <key> [default]
+# get_field <file> <key> [default]（同键多行取最后一个，符合 YAML 常规覆盖语义）
 get_field() {
     local val
-    val=$(parse_flat_yaml "$1" | awk -F'\t' -v k="$2" '$1 == k { print $2; exit }')
+    val=$(parse_flat_yaml "$1" | awk -F'\t' -v k="$2" '$1 == k { v = $2 } END { print v }')
     printf '%s' "${val:-${3:-}}"
 }
 
@@ -109,19 +125,23 @@ regex_escape() { printf '%s\n' "$1" | sed 's/[.]/\\./g'; }
 
 list_hosts() {
     [ -d "$REGISTRIES_DIR" ] || return 0
-    find "$REGISTRIES_DIR" -maxdepth 1 -name '*.yml' -type f | sed 's|.*/||; s|\.yml$||' | sort
+    # /^$/d：basename 恰为 ".yml" 的文件会产出空行
+    find "$REGISTRIES_DIR" -maxdepth 1 -name '*.yml' -type f | sed 's|.*/||; s|\.yml$||; /^$/d' | sort
 }
 
 # ---- 校验 ----
 
 validate_all() {
-    local hosts host dup
+    local hosts host dup culprits
     hosts=$(list_hosts)
-    [ -n "$hosts" ] || die "$REGISTRIES_DIR 为空——先执行: ./manage-upstreams.sh add docker.io"
-    # docker.io 必配：模板默认路由（无前缀请求）指向其实例，缺失会导致 nginx 起不来
-    [ -f "$REGISTRIES_DIR/docker.io.yml" ] \
-        || die "缺少 docker.io.yml（默认上游必配）"
-    for host in $hosts; do
+    [ -n "$hosts" ] || die "$REGISTRIES_DIR 为空——先执行: ./manage-upstreams.sh add $DEFAULT_UPSTREAM"
+    # 默认上游必配：模板默认路由（无前缀请求）指向其实例，缺失会导致 nginx 起不来
+    [ -f "$REGISTRIES_DIR/${DEFAULT_UPSTREAM}.yml" ] \
+        || die "缺少 ${DEFAULT_UPSTREAM}.yml（默认上游必配）"
+    # 逐行 read 而非 for 分词迭代：host 未过校验前不能分词/glob
+    # （"a b.yml" 会被拆成两个"host"、含 * 的名字会被展开），字符集校验必须针对原始文件名
+    while IFS= read -r host; do
+        [ -n "$host" ] || continue
         # 边界：host 字符集（服务名/DNS/location 正则安全）
         [[ "$host" =~ ^[a-z0-9][a-z0-9.-]*$ ]] \
             || die "非法 host 名: ${host}（需匹配 ^[a-z0-9][a-z0-9.-]*\$）"
@@ -131,10 +151,18 @@ validate_all() {
         [ "$host" = "_catalog" ] && die "保留名: $host"
         [ -n "$(get_field "$REGISTRIES_DIR/$host.yml" remoteurl)" ] \
             || die "$host: 缺少 remoteurl"
-    done
+    done < <(list_hosts)
     # 边界：归一化冲突（a-b.com 与 a.b.com 同归一化 → 静默指向同一实例，必须拒绝）
     dup=$(list_hosts | while IFS= read -r h; do norm_host "$h"; done | sort | awk 'seen[$0]++{print; exit}')
-    [ -z "$dup" ] || die "归一化名冲突: ${dup}（不同 host 归一化后相同）"
+    [ -z "$dup" ] || {
+        # 找出归一化后撞名的来源 host，便于定位声明文件
+        # 用 if 而非 "&& echo"：最后一个 host 不匹配时循环退出码为 1，
+        # 叠加 pipefail 会让整个命令替换"失败"，set -e 下冲突报错反而打不出来
+        culprits=$(list_hosts | while IFS= read -r h; do
+            if [ "$(norm_host "$h")" = "$dup" ]; then echo "$h"; fi
+        done | paste -sd' ' -)
+        die "归一化名冲突: ${dup}（来自: ${culprits}）"
+    }
 }
 
 # ---- list ----
