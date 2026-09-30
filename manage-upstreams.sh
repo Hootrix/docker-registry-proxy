@@ -412,13 +412,13 @@ cmd_apply() {
 
 cmd_add() {
     local host=$1; shift
-    local remoteurl="" username="" password="" force=no remoteurl_given=""
+    local remoteurl="" username="" password="" force=no remoteurl_given="" password_given=""
     while [ $# -gt 0 ]; do
         case "$1" in
             # A3：选项缺参数值时给出可读报错（裸 $2 在 set -u 下是晦涩的 unbound variable）
             --remoteurl) [ $# -ge 2 ] || die "--remoteurl 缺少参数值"; remoteurl=$2; remoteurl_given=yes; shift 2 ;;
             --username)  [ $# -ge 2 ] || die "--username 缺少参数值";   username=$2;  shift 2 ;;
-            --password)  [ $# -ge 2 ] || die "--password 缺少参数值";   password=$2;  shift 2 ;;
+            --password)  [ $# -ge 2 ] || die "--password 缺少参数值";   password=$2; password_given=yes; shift 2 ;;
             --force)     force=yes;    shift ;;
             *) die "未知参数: $1" ;;
         esac
@@ -463,6 +463,13 @@ cmd_add() {
     if [ -n "$password" ] && [ -z "$username" ]; then
         die "--password 需与 --username 同时使用"
     fi
+    # --password 显式传入（含空串）：空值直接拒绝（对齐 remoteurl 的 fail-closed）；
+    # history 提示必须在重定向块外发——warn 走 stdout，旧位置在下方 { } > "$f" 内，
+    # 会被写进声明文件且终端不可见；且只应对命令行传入的密码提示（交互 read 的不应触发）
+    if [ -n "$password_given" ]; then
+        [ -n "$password" ] || die "--password 不能为空"
+        warn "--password 经命令行传入，可能进入 shell history"
+    fi
     # A6：交互输入需 TTY（stty 在非终端 stdin 上报错）；管道/CI 场景引导用 --password
     # 旧写法把 TTY 检查/密码读取放在下方 { } > "$f" 重定向块内——die 时文件已被截断创建，
     # 留下 "username 无 password" 的半截声明（且未 chmod 600），后续 apply 会被
@@ -484,10 +491,8 @@ cmd_add() {
         echo "remoteurl: $remoteurl"
         if [ -n "$username" ]; then
             echo "username: $username"
-            # 旧写法此处分支内做 TTY 检查与密码读取（已前移，见上）；非交互时此分支已不可达
-            if [ -n "$password" ]; then
-                warn "--password 经命令行传入，可能进入 shell history"
-            fi
+            # 旧写法此处内嵌 warn "--password 经命令行传入..."——warn 走 stdout，
+            # 在 { } > "$f" 重定向内会被写进声明文件且终端看不到（已前移到写盘前）
             echo "password: $password"
         fi
     } > "$f"
