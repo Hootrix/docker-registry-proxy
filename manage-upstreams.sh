@@ -65,6 +65,10 @@ load_env() {
     # 边界：DEFAULT_UPSTREAM 仅支持 docker.io（默认 location 的 library/ 补全语义）
     [ "${DEFAULT_UPSTREAM:-docker.io}" = "docker.io" ] \
         || die "DEFAULT_UPSTREAM 当前仅支持 docker.io"
+    # 边界：RPS 与 BURST/CONN 同为限流值——非法值经 envsubst 进模板只在容器内 nginx -t 才暴露
+    # （报错行号对应合并后配置，难定位）；BURST/CONN 消费点在生成器故在生成器内校验（见
+    # generate_nginx_confs），RPS 消费点在 nginx 模板（compose up 时渲染）故在此校验（.env 唯一入口）
+    case "${RATE_LIMIT_RPS:-10}" in ''|*[!0-9]*) die "RATE_LIMIT_RPS 非法: ${RATE_LIMIT_RPS}（需为非负整数）" ;; esac
 }
 
 # 平面 YAML 解析：输出 "key<TAB>value"；按首个冒号切分（remoteurl 值含 ://）；跳过注释/空行
@@ -508,6 +512,10 @@ cmd_add() {
     # 值含 " #"：parse_flat_yaml 对行内注释 fail-closed（首个 " #" 起整行丢弃）——声明落盘后
     # apply 会静默缺 remoteurl/凭据并降级匿名；放在密码交互读取之后，CLI 传入与终端键入的值都能覆盖
     case "$remoteurl$username$password" in *' #'*) die "参数值含 ' #'（与行内注释语法冲突，请调整）" ;; esac
+    # 环境预检前移（与 cmd_remove 对称）——旧形态先落盘声明、cmd_apply 才报环境错误，
+    # 留下待处理声明且报错位置靠后（预检项与 cmd_apply 入口一致）
+    command -v docker >/dev/null 2>&1 || die "docker 未安装"
+    [ -f .env ] || die "缺少 .env，先执行: cp .env.example .env"
     mkdir -p "$REGISTRIES_DIR"
     # 旧形态 { } > "$f" 以当前 umask（022 → 644）创建文件，chmod 600 前存在明文窗口；
     # 改子壳内 umask 077，从创建即 600 且不外泄到调用方；chmod 600 保留作冗余兜底
