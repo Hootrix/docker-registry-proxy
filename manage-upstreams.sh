@@ -412,11 +412,11 @@ cmd_apply() {
 
 cmd_add() {
     local host=$1; shift
-    local remoteurl="" username="" password="" force=no
+    local remoteurl="" username="" password="" force=no remoteurl_given=""
     while [ $# -gt 0 ]; do
         case "$1" in
             # A3：选项缺参数值时给出可读报错（裸 $2 在 set -u 下是晦涩的 unbound variable）
-            --remoteurl) [ $# -ge 2 ] || die "--remoteurl 缺少参数值"; remoteurl=$2; shift 2 ;;
+            --remoteurl) [ $# -ge 2 ] || die "--remoteurl 缺少参数值"; remoteurl=$2; remoteurl_given=yes; shift 2 ;;
             --username)  [ $# -ge 2 ] || die "--username 缺少参数值";   username=$2;  shift 2 ;;
             --password)  [ $# -ge 2 ] || die "--password 缺少参数值";   password=$2;  shift 2 ;;
             --force)     force=yes;    shift ;;
@@ -440,13 +440,29 @@ cmd_add() {
             die "归一化名冲突: ${host} 与 ${existing}（同归一化为 ${norm_existing}）"
         fi
     done < <(list_hosts)
-    # docker.io 特例：API 端点是 registry-1.docker.io
-    if [ -z "$remoteurl" ]; then
+    # 旧结构 if [ -z "$remoteurl" ] 把「未传」与「显式传空串」合并进默认值分支，
+    # 其后的空值 die 永远不可达（实测 add ghcr.io --remoteurl "" 落盘默认值且 exit 0），
+    # A4 注释「显式传入空 remoteurl 在写入前拒绝」与实际行为相反——按 given 标记位拆开：
+    # 旧形态:
+    # if [ -z "$remoteurl" ]; then
+    #     if [ "$host" = "docker.io" ]; then remoteurl="https://registry-1.docker.io"
+    #     else remoteurl="https://$host"; fi
+    # fi
+    # [ -n "$remoteurl" ] || die "remoteurl 不能为空"
+    if [ -n "$remoteurl_given" ]; then
+        # 显式传入（含空串）在写入前拒绝——写入后才报错会留下毒声明
+        [ -n "$remoteurl" ] || die "remoteurl 不能为空"
+    else
+        # docker.io 特例：API 端点是 registry-1.docker.io
         if [ "$host" = "docker.io" ]; then remoteurl="https://registry-1.docker.io"
         else remoteurl="https://$host"; fi
     fi
-    # A4：显式传入空 remoteurl 在写入前拒绝（写入后 apply 才报错同样会留下毒声明）
-    [ -n "$remoteurl" ] || die "remoteurl 不能为空"
+    # --password 无 --username：凭据会被静默丢弃（声明只在有 username 时才写 password）——直接拒绝。
+    # 旧形态 warn 嵌在下方 username 块内，add x --password y 零警告、声明无 password、上游静默匿名；
+    # 用 if 形式（对齐 validate_all 的 set -e 规避写法，不用 [ ] && die 链）
+    if [ -n "$password" ] && [ -z "$username" ]; then
+        die "--password 需与 --username 同时使用"
+    fi
     # A6：交互输入需 TTY（stty 在非终端 stdin 上报错）；管道/CI 场景引导用 --password
     # 旧写法把 TTY 检查/密码读取放在下方 { } > "$f" 重定向块内——die 时文件已被截断创建，
     # 留下 "username 无 password" 的半截声明（且未 chmod 600），后续 apply 会被
